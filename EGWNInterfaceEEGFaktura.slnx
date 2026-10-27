@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="EGWNInterfaceEEGFaktura\EGWNInterfaceEEGFaktura.csproj" />
+  <Project Path="EGWNInterfaceEEGFaktura.Domain\EGWNInterfaceEEGFaktura.Domain.csproj" />
+  <Project Path="EGWNInterfaceEEGFaktura.Application\EGWNInterfaceEEGFaktura.Application.csproj" />
+  <Project Path="EGWNInterfaceEEGFaktura.Infrastructure\EGWNInterfaceEEGFaktura.Infrastructure.csproj" />
+  <Project Path="EGWNInterfaceEEGFaktura.Tests\EGWNInterfaceEEGFaktura.Tests.csproj" />
+</Solution>
