@@ -7,7 +7,7 @@ public sealed class RabbitMqOptions
     public const string SectionName = "RabbitMq";
 
     [Required]
-    public string HostName { get; set; } = string.Empty;
+    public string HostName { get; set; } = "localhost";
 
     [Range(1, 65535)]
     public int Port { get; set; } = 5672;
@@ -18,7 +18,18 @@ public sealed class RabbitMqOptions
 
     public string VirtualHost { get; set; } = "/";
 
-    public string Exchange { get; set; } = string.Empty;
+    [Required]
+    public string Exchange { get; set; } = "eda.sync";
 
-    public string RoutingKey { get; set; } = string.Empty;
+    [Required]
+    public string ExchangeType { get; set; } = "topic";
+
+    [Required]
+    public string RoutingKey { get; set; } = "eda.sync.result";
+
+    public string QueueName { get; set; } = "egwn.measurements";
+
+    public string DeadLetterQueue { get; set; } = "egwn.measurements.dlq";
+
+    public int? MessageTtlMilliseconds { get; set; }
 }

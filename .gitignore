@@ -33,3 +33,4 @@ _ReSharper*/
 .idea/
 #Nuget packages folder
 packages/
+EGWNInterfaceEEGFaktura.Tests/live.runsettings

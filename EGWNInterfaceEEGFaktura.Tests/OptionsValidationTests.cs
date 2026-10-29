@@ -18,7 +18,7 @@ public sealed class OptionsValidationTests
     [Fact]
     public void RabbitMqOptions_RequiresAHostName()
     {
-        var options = new RabbitMqOptions();
+        var options = new RabbitMqOptions { HostName = string.Empty };
 
         var validationResults = Validate(options);
 
