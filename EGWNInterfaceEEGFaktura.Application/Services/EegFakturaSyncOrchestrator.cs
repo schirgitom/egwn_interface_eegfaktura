@@ -19,10 +19,53 @@ public sealed class EegFakturaSyncOrchestrator(
     {
         var to = timeProvider.GetUtcNow();
         var from = to.AddDays(-_options.LookbackDays);
-        var meterPoints = await GetMeterPointsAsync(cancellationToken);
-        var readingCount = await FetchAndPublishAsync(meterPoints, from, to, cancellationToken);
+        var meterCount = 0;
+        var readingCount = 0;
+        foreach (var tenant in _options.GetTenants())
+        {
+            var meterPoints = await GetMeterPointsAsync(tenant, cancellationToken);
+            meterCount += meterPoints.Count;
+            readingCount += await FetchAndPublishAsync(tenant, meterPoints, from, to, cancellationToken);
+        }
 
-        return new SyncResult(from, to, meterPoints.Count, readingCount);
+        return new SyncResult(from, to, meterCount, readingCount);
+    }
+
+    public async Task<MeterReadingTriggerResponse> TriggerMeterReadingAsync(
+        MeterReadingTriggerRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.MeterId is not null && string.IsNullOrWhiteSpace(request.MeterId))
+        {
+            throw new ArgumentException("The meter ID must not be empty.", nameof(request));
+        }
+
+        if (request.MeterId is not null && string.IsNullOrWhiteSpace(request.TenantId))
+        {
+            throw new ArgumentException("A tenant ID is required for a single meter.", nameof(request));
+        }
+
+        var to = request.ToUtc ?? timeProvider.GetUtcNow();
+        var from = request.FromUtc ?? to.AddDays(-_options.LookbackDays);
+        if (from > to)
+        {
+            throw new ArgumentException("The trigger start must be earlier than or equal to the end.", nameof(request));
+        }
+
+        var tenants = request.TenantId is null
+            ? _options.GetTenants()
+            : [_options.ResolveTenant(request.TenantId)];
+        var readingCount = 0;
+        foreach (var tenant in tenants)
+        {
+            IReadOnlyList<EegMeterPoint> meterPoints = request.MeterId is null
+                ? await GetMeterPointsAsync(tenant, cancellationToken)
+                : [new EegMeterPoint(request.MeterId, null)];
+            readingCount += await FetchAndPublishAsync(tenant, meterPoints, from, to, cancellationToken);
+        }
+
+        return new MeterReadingTriggerResponse(request.MeterId, from, to, readingCount);
     }
 
     public async Task<BackfillResult> BackfillAsync(
@@ -30,8 +73,17 @@ public sealed class EegFakturaSyncOrchestrator(
         DateTimeOffset? to,
         CancellationToken cancellationToken)
     {
-        var meterPoints = await GetMeterPointsAsync(cancellationToken);
-        if (meterPoints.Count == 0)
+        var tenantMeters = new List<(EegFakturaTenantOptions Tenant, IReadOnlyList<EegMeterPoint> MeterPoints)>();
+        foreach (var tenant in _options.GetTenants())
+        {
+            var meterPoints = await GetMeterPointsAsync(tenant, cancellationToken);
+            if (meterPoints.Count > 0)
+            {
+                tenantMeters.Add((tenant, meterPoints));
+            }
+        }
+
+        if (tenantMeters.Count == 0)
         {
             var emptyTo = to ?? timeProvider.GetUtcNow();
             var emptyFrom = from ?? emptyTo;
@@ -39,13 +91,13 @@ public sealed class EegFakturaSyncOrchestrator(
         }
 
         var end = to ?? timeProvider.GetUtcNow();
-        if (!from.HasValue && meterPoints.Any(meterPoint => !meterPoint.ActiveSince.HasValue))
+        if (!from.HasValue && tenantMeters.Any(entry => entry.MeterPoints.Any(meterPoint => !meterPoint.ActiveSince.HasValue)))
         {
             throw new InvalidOperationException(
                 "EEGFaktura did not provide activation dates for every meter; pass the backfill start date explicitly.");
         }
 
-        var start = from ?? meterPoints.Min(meterPoint => meterPoint.ActiveSince!.Value);
+        var start = from ?? tenantMeters.Min(entry => entry.MeterPoints.Min(meterPoint => meterPoint.ActiveSince!.Value));
 
         if (start == default)
         {
@@ -71,26 +123,32 @@ public sealed class EegFakturaSyncOrchestrator(
                 chunkEnd = end;
             }
 
-            readingCount += await FetchAndPublishAsync(meterPoints, chunkStart, chunkEnd, cancellationToken);
-            requestCount++;
+            foreach (var (tenant, meterPoints) in tenantMeters)
+            {
+                readingCount += await FetchAndPublishAsync(tenant, meterPoints, chunkStart, chunkEnd, cancellationToken);
+                requestCount++;
+            }
             chunkStart = chunkEnd.AddMilliseconds(1);
         }
 
-        return new BackfillResult(start, end, meterPoints.Count, readingCount, requestCount);
+        return new BackfillResult(start, end, tenantMeters.Sum(entry => entry.MeterPoints.Count), readingCount, requestCount);
     }
 
-    private async Task<IReadOnlyList<EegMeterPoint>> GetMeterPointsAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<EegMeterPoint>> GetMeterPointsAsync(
+        EegFakturaTenantOptions tenant,
+        CancellationToken cancellationToken)
     {
-        var meterPoints = await eegFakturaClient.GetMeterPointsAsync(_options.TenantId, cancellationToken);
+        var meterPoints = await eegFakturaClient.GetMeterPointsAsync(tenant, cancellationToken);
         if (meterPoints.Count == 0)
         {
-            logger.LogWarning("No eligible EEGFaktura meter points found for tenant {TenantId}", _options.TenantId);
+            logger.LogWarning("No eligible EEGFaktura meter points found for tenant {TenantId}", tenant.TenantId);
         }
 
         return meterPoints;
     }
 
     private async Task<int> FetchAndPublishAsync(
+        EegFakturaTenantOptions tenant,
         IReadOnlyList<EegMeterPoint> meterPoints,
         DateTimeOffset from,
         DateTimeOffset to,
@@ -103,8 +161,7 @@ public sealed class EegFakturaSyncOrchestrator(
 
         var meterIds = meterPoints.Select(meterPoint => meterPoint.MeterPointNumber).ToArray();
         var rawReadings = await eegFakturaClient.FetchRawReadingsAsync(
-            _options.EegId,
-            _options.TenantId,
+            tenant,
             meterIds,
             from.ToUnixTimeMilliseconds(),
             to.ToUnixTimeMilliseconds(),
@@ -128,8 +185,8 @@ public sealed class EegFakturaSyncOrchestrator(
 
             var publication = new EegMeterReadingsPublication(
                 meterPoint.MeterPointNumber,
-                _options.TenantId,
-                string.IsNullOrWhiteSpace(_options.CommunityName) ? _options.TenantId : _options.CommunityName,
+                tenant.TenantId,
+                string.IsNullOrWhiteSpace(tenant.CommunityName) ? tenant.TenantId : tenant.CommunityName,
                 meterReadings.Select(EegReadingMapper.Map).ToArray(),
                 timeProvider.GetUtcNow());
 

@@ -37,7 +37,7 @@ builder.Services.AddHttpClient<IEegFakturaClient, EegFakturaClient>((serviceProv
     var options = serviceProvider.GetRequiredService<IOptions<EegFakturaOptions>>().Value;
     client.BaseAddress = new Uri($"{options.BaseUrl.TrimEnd('/')}/", UriKind.Absolute);
     client.Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds);
-});
+}).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 
 builder.Services.AddSingleton<IEegFakturaResultPublisher, RabbitMqEegFakturaResultPublisher>();
 builder.Services.AddSingleton<IEegFakturaSyncOrchestrator, EegFakturaSyncOrchestrator>();
@@ -63,10 +63,11 @@ builder.Host.UseSerilog((context, loggerConfiguration) =>
 var app = builder.Build();
 
 var eegFakturaOptions = app.Services.GetRequiredService<IOptions<EegFakturaOptions>>().Value;
-if (eegFakturaOptions.Password.Contains(':'))
+foreach (var tenant in eegFakturaOptions.GetTenants().Where(tenant => tenant.Password.Contains(':')))
 {
     app.Logger.LogWarning(
-        "The EEGFaktura password contains ':'. Energystore Basic authentication does not support ':' in passwords.");
+        "The EEGFaktura password for tenant {TenantId} contains ':'. Energystore Basic authentication does not support ':' in passwords.",
+        tenant.TenantId);
 }
 
 app.UseSwagger();

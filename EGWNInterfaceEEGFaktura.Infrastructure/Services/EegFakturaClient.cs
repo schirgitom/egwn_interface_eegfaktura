@@ -8,34 +8,32 @@ using EGWNInterfaceEEGFaktura.Application.Abstractions;
 using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Domain;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace EGWNInterfaceEEGFaktura.Infrastructure.Services;
 
 public sealed class EegFakturaClient(
     HttpClient httpClient,
-    IOptions<EegFakturaOptions> options,
     ILogger<EegFakturaClient> logger) : IEegFakturaClient
 {
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private const string ForbiddenMessage =
         "Login fehlgeschlagen oder Tenant nicht im Token – prüfen: Base64-Variante, X-Tenant, kein 2FA/OTP am Konto, Direct Access Grants am Keycloak-Client (Betreiber), EEG_ADMIN für /api.";
-    private readonly EegFakturaOptions _options = options.Value;
 
     public async Task<IReadOnlyList<EegMeterPoint>> GetMeterPointsAsync(
-        string tenantId,
+        EegFakturaTenantOptions tenant,
         CancellationToken cancellationToken)
     {
-        using var request = CreateRequest(HttpMethod.Get, "/api/participant", tenantId);
+        using var request = CreateRequest(HttpMethod.Get, "api/master/masterdata", tenant);
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
+        await LogResponseAsync(response, request, tenant, cancellationToken);
         EnsureSuccess(response);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
         {
-            throw new InvalidDataException("EEGFaktura participant response must be a JSON array.");
+            throw new InvalidDataException("EEGFaktura masterdata response must be a JSON array.");
         }
 
         var meterPoints = new Dictionary<string, EegMeterPoint>(StringComparer.OrdinalIgnoreCase);
@@ -52,9 +50,7 @@ public sealed class EegFakturaClient(
                 var meterId = GetString(meter, "meteringPoint");
                 var status = GetString(meter, "status");
                 if (string.IsNullOrWhiteSpace(meterId)
-                    || string.Equals(status, "INIT", StringComparison.OrdinalIgnoreCase)
-                    || !meter.TryGetProperty("participantState", out var participantState)
-                    || participantState.ValueKind != JsonValueKind.Object)
+                    || string.Equals(status, "INIT", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -72,8 +68,7 @@ public sealed class EegFakturaClient(
     }
 
     public async Task<IReadOnlyDictionary<string, IReadOnlyList<EegRawReading>>> FetchRawReadingsAsync(
-        string eegId,
-        string tenantId,
+        EegFakturaTenantOptions tenant,
         IReadOnlyList<string> meterIds,
         long startUnixMilliseconds,
         long endUnixMilliseconds,
@@ -84,14 +79,14 @@ public sealed class EegFakturaClient(
             throw new ArgumentException("The raw-data start must be earlier than or equal to the end.", nameof(startUnixMilliseconds));
         }
 
-        var path = $"/energystore/eeg/v2/{Uri.EscapeDataString(eegId)}/raw";
-        using var request = CreateRequest(HttpMethod.Post, path, tenantId);
+        using var request = CreateRequest(HttpMethod.Post, "energystore/query/rawdata", tenant);
         request.Content = new StringContent(
-            JsonSerializer.Serialize(new RawDataRequest(meterIds, startUnixMilliseconds, endUnixMilliseconds), SerializerOptions),
+            JsonSerializer.Serialize(new RawDataRequest(tenant.EcId, meterIds, startUnixMilliseconds, endUnixMilliseconds), SerializerOptions),
             Encoding.UTF8,
             "application/json");
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
+        await LogResponseAsync(response, request, tenant, cancellationToken);
         EnsureSuccess(response);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -117,15 +112,41 @@ public sealed class EegFakturaClient(
             {
                 if (reading is null
                     || !reading.Timestamp.HasValue
-                    || reading.Value is not { Length: >= 2 })
+                    || reading.Value is not { Length: >= 2 } values
+                    || values[0] is not { } total
+                    || total < 0)
                 {
                     throw new InvalidDataException($"EEGFaktura returned an invalid reading for meter '{meterId}'.");
                 }
 
+                decimal communityShare;
+                if (string.Equals(meterData.Direction, "CONSUMPTION", StringComparison.OrdinalIgnoreCase)
+                    && values is { Length: >= 3 }
+                    && values[2] is { } utilization)
+                {
+                    communityShare = utilization;
+                }
+                else if (string.Equals(meterData.Direction, "GENERATION", StringComparison.OrdinalIgnoreCase)
+                         && values[1] is { } surplus)
+                {
+                    communityShare = total - surplus;
+                }
+                else
+                {
+                    throw new InvalidDataException(
+                        $"EEGFaktura returned an invalid {meterData.Direction ?? "missing"} reading for meter '{meterId}'.");
+                }
+
+                if (communityShare < 0 || communityShare > total)
+                {
+                    throw new InvalidDataException(
+                        $"EEGFaktura returned an out-of-range EEG share for meter '{meterId}'.");
+                }
+
                 meterReadings.Add(new EegRawReading(
                     DateTimeOffset.FromUnixTimeMilliseconds(reading.Timestamp.Value),
-                    reading.Value[0],
-                    reading.Value[1]));
+                    total,
+                    communityShare));
             }
 
             readings[meterId] = meterReadings;
@@ -134,20 +155,64 @@ public sealed class EegFakturaClient(
         return readings;
     }
 
-    private HttpRequestMessage CreateRequest(HttpMethod method, string path, string tenantId)
+    private static HttpRequestMessage CreateRequest(HttpMethod method, string path, EegFakturaTenantOptions tenant)
     {
         var request = new HttpRequestMessage(method, path);
-        var credentials = Encoding.UTF8.GetBytes($"{_options.Username}:{_options.Password}");
+        var credentials = Encoding.UTF8.GetBytes($"{tenant.Username}:{tenant.Password}");
         var authorization = Convert.ToBase64String(credentials);
-        if (path.StartsWith("/energystore/", StringComparison.Ordinal))
+        if (path.StartsWith("energystore/", StringComparison.Ordinal))
         {
             authorization = authorization.Replace('+', '-').Replace('/', '_');
         }
 
         request.Headers.Authorization = new AuthenticationHeaderValue("Basic", authorization);
-        request.Headers.Add("X-Tenant", tenantId);
+        request.Headers.Add("X-Tenant", tenant.TenantId);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         return request;
+    }
+
+    private async Task LogResponseAsync(
+        HttpResponseMessage response,
+        HttpRequestMessage sentRequest,
+        EegFakturaTenantOptions tenant,
+        CancellationToken cancellationToken)
+    {
+        if (!logger.IsEnabled(LogLevel.Debug))
+        {
+            return;
+        }
+
+        var request = response.RequestMessage ?? sentRequest;
+        var headers = string.Join(", ", request.Headers.Select(header => header.Key));
+        var tenantHeader = request.Headers.TryGetValues("X-Tenant", out var values)
+            ? string.Join(", ", values)
+            : null;
+        var responseHeaders = string.Join(", ", response.Headers.Concat(response.Content.Headers).Select(header =>
+            header.Key.Equals("Set-Cookie", StringComparison.OrdinalIgnoreCase)
+            || header.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)
+            || header.Key.Equals("Proxy-Authenticate", StringComparison.OrdinalIgnoreCase)
+                ? $"{header.Key}: [REDACTED]"
+                : $"{header.Key}: {string.Join(", ", header.Value)}"));
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!string.IsNullOrEmpty(tenant.Password))
+        {
+            var basicToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{tenant.Username}:{tenant.Password}"));
+            foreach (var secret in new[] { tenant.Password, basicToken, basicToken.Replace('+', '-').Replace('/', '_') }
+                         .Distinct(StringComparer.Ordinal))
+            {
+                body = body.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
+                responseHeaders = responseHeaders.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
+            }
+        }
+
+        logger.LogDebug(
+            "EEGFaktura response: URL {RequestUri}, request header names {RequestHeaders}, X-Tenant {TenantId}, status {StatusCode}, response headers {ResponseHeaders}, body {ResponseBody}",
+            request.RequestUri,
+            headers,
+            tenantHeader,
+            (int)response.StatusCode,
+            responseHeaders,
+            body);
     }
 
     private void EnsureSuccess(HttpResponseMessage response)
@@ -176,9 +241,7 @@ public sealed class EegFakturaClient(
 
     private static DateTimeOffset? GetActiveSince(JsonElement meter)
     {
-        if (!meter.TryGetProperty("participantState", out var participantState)
-            || participantState.ValueKind != JsonValueKind.Object
-            || !participantState.TryGetProperty("activeSince", out var activeSince)
+        if (!meter.TryGetProperty("activeSince", out var activeSince)
             || activeSince.ValueKind != JsonValueKind.String)
         {
             return null;
@@ -194,12 +257,16 @@ public sealed class EegFakturaClient(
     }
 
     private sealed record RawDataRequest(
+        string EcId,
         IReadOnlyList<string> Meters,
         long Start,
         long End);
 
     private sealed class RawMeterData
     {
+        [JsonPropertyName("direction")]
+        public string? Direction { get; init; }
+
         [JsonPropertyName("data")]
         public RawReading?[]? Data { get; init; }
     }

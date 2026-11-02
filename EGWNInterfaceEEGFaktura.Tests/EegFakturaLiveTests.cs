@@ -1,7 +1,6 @@
 using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Infrastructure.Services;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
 using System.Xml.Linq;
 
 namespace EGWNInterfaceEEGFaktura.Tests;
@@ -23,26 +22,28 @@ public sealed class EegFakturaLiveTests
         var settings = new EegFakturaOptions
         {
             BaseUrl = GetSetting("EEGFAKTURA_LIVE_BASE_URL", "https://eeg-faktura.at"),
+            TimeoutSeconds = 60
+        };
+        var tenant = new EegFakturaTenantOptions
+        {
             Username = username,
             Password = password,
             TenantId = GetSetting("EEGFAKTURA_LIVE_TENANT_ID", "RC101900"),
-            EegId = GetSetting("EEGFAKTURA_LIVE_EEG_ID", "AT00800000000RC101900000000000138"),
-            TimeoutSeconds = 60
+            EcId = GetSetting("EEGFAKTURA_LIVE_EC_ID", "AT00800000000RC101900000000000138")
         };
 
-        using var httpClient = new HttpClient
+        using var httpClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
         {
             BaseAddress = new Uri($"{settings.BaseUrl.TrimEnd('/')}/"),
             Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
         };
         var client = new EegFakturaClient(
             httpClient,
-            Options.Create(settings),
             NullLogger<EegFakturaClient>.Instance);
         var meterId = GetSetting(
             "EEGFAKTURA_LIVE_METER_ID",
             "AT0080000816000000202009030075815");
-        var meterPoints = await client.GetMeterPointsAsync(settings.TenantId, CancellationToken.None);
+        var meterPoints = await client.GetMeterPointsAsync(tenant, CancellationToken.None);
         Assert.Contains(meterPoints, meter => string.Equals(
             meter.MeterPointNumber,
             meterId,
@@ -51,8 +52,7 @@ public sealed class EegFakturaLiveTests
         var start = GetUnixMilliseconds("EEGFAKTURA_LIVE_START", 1793055600000);
         var end = GetUnixMilliseconds("EEGFAKTURA_LIVE_END", 1793141999999);
         var response = await client.FetchRawReadingsAsync(
-            settings.EegId,
-            settings.TenantId,
+            tenant,
             [meterId],
             start,
             end,

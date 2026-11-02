@@ -44,4 +44,18 @@ public sealed class EegReadingMapperTests
         Assert.Null(mapped.GridShareValue);
         Assert.Null(mapped.CommunityShareValue);
     }
+
+    [Fact]
+    public void Map_WhenActualEegCoverageEqualsTotal_DoesNotProduceNegativeGridShare()
+    {
+        var reading = new EegRawReading(
+            DateTimeOffset.Parse("2026-10-27T09:00:00Z"),
+            0.007m,
+            0.007m);
+
+        var mapped = EegReadingMapper.Map(reading);
+
+        Assert.Equal(0m, mapped.GridShareValue);
+        Assert.Equal(0.007m, mapped.CommunityShareValue);
+    }
 }

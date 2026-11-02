@@ -1,14 +1,16 @@
+using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Domain;
 
 namespace EGWNInterfaceEEGFaktura.Application.Abstractions;
 
 public interface IEegFakturaClient
 {
-    Task<IReadOnlyList<EegMeterPoint>> GetMeterPointsAsync(string tenantId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<EegMeterPoint>> GetMeterPointsAsync(
+        EegFakturaTenantOptions tenant,
+        CancellationToken cancellationToken);
 
     Task<IReadOnlyDictionary<string, IReadOnlyList<EegRawReading>>> FetchRawReadingsAsync(
-        string eegId,
-        string tenantId,
+        EegFakturaTenantOptions tenant,
         IReadOnlyList<string> meterIds,
         long startUnixMilliseconds,
         long endUnixMilliseconds,
