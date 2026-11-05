@@ -2,7 +2,9 @@ using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Application.Abstractions;
 using EGWNInterfaceEEGFaktura.Application.Services;
 using EGWNInterfaceEEGFaktura.Infrastructure.Services;
+using EGWNInterfaceEEGFaktura.Infrastructure.Hosting;
 using EGWNInterfaceEEGFaktura.Jobs;
+using EGWNInterfaceEEGFaktura.Telemetry;
 using Microsoft.Extensions.Options;
 using Prometheus;
 using Quartz;
@@ -10,6 +12,24 @@ using Serilog;
 using AppQuartzOptions = EGWNInterfaceEEGFaktura.Application.Options.QuartzOptions;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var consulUrl = Environment.GetEnvironmentVariable("CONSUL_URL")
+    ?? builder.Configuration["Consul:Address"];
+var consulKvPath = Environment.GetEnvironmentVariable("CONSUL_KV_PATH")
+    ?? builder.Configuration["Consul:Key"]
+    ?? builder.Configuration["Consul:KvPath"]
+    ?? "egwn-interface-eegfaktura/appsettings";
+
+if (!string.IsNullOrWhiteSpace(consulUrl))
+{
+    builder.Configuration.AddConsulKv(consulUrl, consulKvPath);
+    if (string.IsNullOrWhiteSpace(builder.Configuration["Consul:Address"]))
+    {
+        builder.Configuration["Consul:Address"] = consulUrl;
+    }
+
+    Console.WriteLine($"[Startup] Loaded configuration from Consul key '{consulKvPath}'");
+}
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -24,6 +44,19 @@ builder.Services.AddOptions<EegFakturaOptions>()
 builder.Services.AddOptions<RabbitMqOptions>()
     .BindConfiguration(RabbitMqOptions.SectionName)
     .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+builder.Services.AddOptions<ConsulOptions>()
+    .BindConfiguration(ConsulOptions.SectionName)
+    .Validate(options => !options.Enabled || Uri.TryCreate(options.Address, UriKind.Absolute, out var address)
+        && (address.Scheme == Uri.UriSchemeHttp || address.Scheme == Uri.UriSchemeHttps),
+        "Consul:Address must be an absolute HTTP(S) URL when registration is enabled.")
+    .Validate(options => !options.Enabled || !string.IsNullOrWhiteSpace(options.ServiceId)
+        && !string.IsNullOrWhiteSpace(options.ServiceName)
+        && options.Ttl > TimeSpan.Zero
+        && options.HeartbeatInterval > TimeSpan.Zero
+        && options.HeartbeatInterval < options.Ttl,
+        "Consul service ID and name are required, and heartbeat interval must be between zero and TTL.")
     .ValidateOnStart();
 
 builder.Services.AddOptions<AppQuartzOptions>()
@@ -41,6 +74,9 @@ builder.Services.AddHttpClient<IEegFakturaClient, EegFakturaClient>((serviceProv
 
 builder.Services.AddSingleton<IEegFakturaResultPublisher, RabbitMqEegFakturaResultPublisher>();
 builder.Services.AddSingleton<IEegFakturaSyncOrchestrator, EegFakturaSyncOrchestrator>();
+builder.Services.AddSingleton<IEegFakturaMetrics, PrometheusEegFakturaMetrics>();
+builder.Services.AddHostedService<ConsulRegistrationHostedService>();
+builder.Services.AddHostedService<QuartzScheduleMetricsHostedService>();
 
 var quartzOptions = builder.Configuration.GetSection(AppQuartzOptions.SectionName).Get<AppQuartzOptions>()
     ?? new AppQuartzOptions();

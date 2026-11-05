@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using EGWNInterfaceEEGFaktura.Application.Abstractions;
 using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Domain;
@@ -9,6 +10,7 @@ namespace EGWNInterfaceEEGFaktura.Application.Services;
 public sealed class EegFakturaSyncOrchestrator(
     IEegFakturaClient eegFakturaClient,
     IEegFakturaResultPublisher resultPublisher,
+    IEegFakturaMetrics metrics,
     IOptions<EegFakturaOptions> options,
     TimeProvider timeProvider,
     ILogger<EegFakturaSyncOrchestrator> logger) : IEegFakturaSyncOrchestrator
@@ -23,9 +25,19 @@ public sealed class EegFakturaSyncOrchestrator(
         var readingCount = 0;
         foreach (var tenant in _options.GetTenants())
         {
-            var meterPoints = await GetMeterPointsAsync(tenant, cancellationToken);
-            meterCount += meterPoints.Count;
-            readingCount += await FetchAndPublishAsync(tenant, meterPoints, from, to, cancellationToken);
+            logger.LogInformation("Starting EEGFaktura sync for tenant {TenantId}", tenant.TenantId);
+            try
+            {
+                var meterPoints = await GetMeterPointsAsync(tenant, cancellationToken);
+                meterCount += meterPoints.Count;
+                readingCount += await FetchAndPublishAsync(tenant, meterPoints, from, to, cancellationToken);
+                logger.LogInformation("Completed EEGFaktura sync for tenant {TenantId}", tenant.TenantId);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "EEGFaktura sync failed for tenant {TenantId} (ecId {EcId})", tenant.TenantId, tenant.EcId);
+                throw;
+            }
         }
 
         return new SyncResult(from, to, meterCount, readingCount);
@@ -87,6 +99,8 @@ public sealed class EegFakturaSyncOrchestrator(
         {
             var emptyTo = to ?? timeProvider.GetUtcNow();
             var emptyFrom = from ?? emptyTo;
+            metrics.RecordBackfillStarted(0);
+            metrics.RecordBackfillCompleted(0, 0, 0, 0, 0, TimeSpan.Zero);
             return new BackfillResult(emptyFrom, emptyTo, 0, 0, 0);
         }
 
@@ -112,23 +126,53 @@ public sealed class EegFakturaSyncOrchestrator(
 
         var readingCount = 0;
         var requestCount = 0;
-        var chunkStart = start;
-
-        while (chunkStart <= end)
+        var chunkCount = 0;
+        for (var window = start; window <= end; window = window.AddDays(_options.BackfillChunkDays).AddMilliseconds(1))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var chunkEnd = chunkStart.AddDays(_options.BackfillChunkDays);
-            if (chunkEnd > end)
-            {
-                chunkEnd = end;
-            }
+            chunkCount++;
+        }
 
-            foreach (var (tenant, meterPoints) in tenantMeters)
+        var totalRequests = checked(chunkCount * tenantMeters.Count);
+        var completed = 0;
+        var failed = 0;
+        var backfillStart = Stopwatch.GetTimestamp();
+        metrics.RecordBackfillStarted(totalRequests);
+        try
+        {
+            var chunkStart = start;
+            while (chunkStart <= end)
             {
-                readingCount += await FetchAndPublishAsync(tenant, meterPoints, chunkStart, chunkEnd, cancellationToken);
-                requestCount++;
+                cancellationToken.ThrowIfCancellationRequested();
+                var chunkEnd = chunkStart.AddDays(_options.BackfillChunkDays);
+                if (chunkEnd > end)
+                {
+                    chunkEnd = end;
+                }
+
+                foreach (var (tenant, meterPoints) in tenantMeters)
+                {
+                    try
+                    {
+                        readingCount += await FetchAndPublishAsync(tenant, meterPoints, chunkStart, chunkEnd, cancellationToken);
+                        requestCount++;
+                        completed++;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        failed++;
+                        throw;
+                    }
+
+                    metrics.UpdateBackfillProgress(completed, failed, totalRequests - completed - failed);
+                }
+                chunkStart = chunkEnd.AddMilliseconds(1);
             }
-            chunkStart = chunkEnd.AddMilliseconds(1);
+        }
+        finally
+        {
+            metrics.RecordBackfillCompleted(
+                totalRequests, completed, failed, totalRequests - completed - failed,
+                readingCount, Stopwatch.GetElapsedTime(backfillStart));
         }
 
         return new BackfillResult(start, end, tenantMeters.Sum(entry => entry.MeterPoints.Count), readingCount, requestCount);
@@ -160,38 +204,61 @@ public sealed class EegFakturaSyncOrchestrator(
         }
 
         var meterIds = meterPoints.Select(meterPoint => meterPoint.MeterPointNumber).ToArray();
-        var rawReadings = await eegFakturaClient.FetchRawReadingsAsync(
-            tenant,
-            meterIds,
-            from.ToUnixTimeMilliseconds(),
-            to.ToUnixTimeMilliseconds(),
-            cancellationToken);
+        var fetchStart = Stopwatch.GetTimestamp();
+        IReadOnlyDictionary<string, IReadOnlyList<EegRawReading>> rawReadings;
+        try
+        {
+            rawReadings = await eegFakturaClient.FetchRawReadingsAsync(
+                tenant,
+                meterIds,
+                from.ToUnixTimeMilliseconds(),
+                to.ToUnixTimeMilliseconds(),
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            foreach (var meterId in meterIds)
+            {
+                metrics.RecordMeterReading(meterId, tenant.TenantId, 0, Stopwatch.GetElapsedTime(fetchStart), false);
+            }
+
+            throw;
+        }
 
         var readingCount = 0;
         foreach (var meterPoint in meterPoints)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            if (!rawReadings.TryGetValue(meterPoint.MeterPointNumber, out var meterReadings)
-                || meterReadings.Count == 0)
+            try
             {
-                logger.LogDebug(
-                    "EEGFaktura returned no readings for meter {MeterPointNumber} in {From}–{To}",
+                if (!rawReadings.TryGetValue(meterPoint.MeterPointNumber, out var meterReadings)
+                    || meterReadings.Count == 0)
+                {
+                    logger.LogDebug(
+                        "EEGFaktura returned no readings for meter {MeterPointNumber} in {From}–{To}",
+                        meterPoint.MeterPointNumber,
+                        from,
+                        to);
+                    metrics.RecordMeterReading(meterPoint.MeterPointNumber, tenant.TenantId, 0, Stopwatch.GetElapsedTime(fetchStart), true);
+                    continue;
+                }
+
+                var publication = new EegMeterReadingsPublication(
                     meterPoint.MeterPointNumber,
-                    from,
-                    to);
-                continue;
+                    tenant.TenantId,
+                    string.IsNullOrWhiteSpace(tenant.CommunityName) ? tenant.TenantId : tenant.CommunityName,
+                    meterReadings.Select(EegReadingMapper.Map).ToArray(),
+                    timeProvider.GetUtcNow());
+
+                await resultPublisher.PublishAsync(publication, cancellationToken);
+                readingCount += publication.Readings.Count;
+                metrics.RecordMeterReading(meterPoint.MeterPointNumber, tenant.TenantId, publication.Readings.Count, Stopwatch.GetElapsedTime(fetchStart), true);
             }
-
-            var publication = new EegMeterReadingsPublication(
-                meterPoint.MeterPointNumber,
-                tenant.TenantId,
-                string.IsNullOrWhiteSpace(tenant.CommunityName) ? tenant.TenantId : tenant.CommunityName,
-                meterReadings.Select(EegReadingMapper.Map).ToArray(),
-                timeProvider.GetUtcNow());
-
-            await resultPublisher.PublishAsync(publication, cancellationToken);
-            readingCount += publication.Readings.Count;
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                metrics.RecordMeterReading(meterPoint.MeterPointNumber, tenant.TenantId, 0, Stopwatch.GetElapsedTime(fetchStart), false);
+                throw;
+            }
         }
 
         logger.LogInformation(

@@ -27,7 +27,7 @@ public sealed class EegFakturaClient(
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
         await LogResponseAsync(response, request, tenant, cancellationToken);
-        EnsureSuccess(response);
+        await EnsureSuccessAsync(response, request, tenant, cancellationToken);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
@@ -81,13 +81,19 @@ public sealed class EegFakturaClient(
 
         using var request = CreateRequest(HttpMethod.Post, "energystore/query/rawdata", tenant);
         request.Content = new StringContent(
-            JsonSerializer.Serialize(new RawDataRequest(tenant.EcId, meterIds, startUnixMilliseconds, endUnixMilliseconds), SerializerOptions),
+            JsonSerializer.Serialize(
+                new RawDataRequest(
+                    tenant.EcId,
+                    meterIds.Select(meterId => new RawDataTarget(meterId)).ToArray(),
+                    startUnixMilliseconds,
+                    endUnixMilliseconds),
+                SerializerOptions),
             Encoding.UTF8,
             "application/json");
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
         await LogResponseAsync(response, request, tenant, cancellationToken);
-        EnsureSuccess(response);
+        await EnsureSuccessAsync(response, request, tenant, cancellationToken);
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         var rawResponse = await JsonSerializer.DeserializeAsync<Dictionary<string, RawMeterData>>(
@@ -193,17 +199,8 @@ public sealed class EegFakturaClient(
             || header.Key.Equals("Proxy-Authenticate", StringComparison.OrdinalIgnoreCase)
                 ? $"{header.Key}: [REDACTED]"
                 : $"{header.Key}: {string.Join(", ", header.Value)}"));
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (!string.IsNullOrEmpty(tenant.Password))
-        {
-            var basicToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{tenant.Username}:{tenant.Password}"));
-            foreach (var secret in new[] { tenant.Password, basicToken, basicToken.Replace('+', '-').Replace('/', '_') }
-                         .Distinct(StringComparer.Ordinal))
-            {
-                body = body.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
-                responseHeaders = responseHeaders.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
-            }
-        }
+        var body = Redact(await response.Content.ReadAsStringAsync(cancellationToken), tenant);
+        responseHeaders = Redact(responseHeaders, tenant);
 
         logger.LogDebug(
             "EEGFaktura response: URL {RequestUri}, request header names {RequestHeaders}, X-Tenant {TenantId}, status {StatusCode}, response headers {ResponseHeaders}, body {ResponseBody}",
@@ -215,23 +212,56 @@ public sealed class EegFakturaClient(
             body);
     }
 
-    private void EnsureSuccess(HttpResponseMessage response)
+    private async Task EnsureSuccessAsync(
+        HttpResponseMessage response,
+        HttpRequestMessage sentRequest,
+        EegFakturaTenantOptions tenant,
+        CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode)
         {
             return;
         }
 
+        if (response.StatusCode == HttpStatusCode.BadRequest)
+        {
+            var body = Redact(await response.Content.ReadAsStringAsync(cancellationToken), tenant);
+            logger.LogWarning(
+                "EEGFaktura request rejected: tenant {TenantId}, ecId {EcId}, URL {RequestUri}, HTTP {StatusCode}, response body {ResponseBody}",
+                tenant.TenantId,
+                tenant.EcId,
+                (response.RequestMessage ?? sentRequest).RequestUri,
+                (int)response.StatusCode,
+                body);
+        }
+
         if (response.StatusCode == HttpStatusCode.Forbidden)
         {
-            logger.LogWarning("{AuthenticationFailureMessage}", ForbiddenMessage);
+            logger.LogWarning("EEGFaktura tenant {TenantId}: {AuthenticationFailureMessage}", tenant.TenantId, ForbiddenMessage);
             throw new HttpRequestException(ForbiddenMessage, null, response.StatusCode);
         }
 
         throw new HttpRequestException(
-            $"EEGFaktura request failed with HTTP {(int)response.StatusCode}.",
+            $"EEGFaktura request for tenant '{tenant.TenantId}' failed with HTTP {(int)response.StatusCode}.",
             null,
             response.StatusCode);
+    }
+
+    private static string Redact(string value, EegFakturaTenantOptions tenant)
+    {
+        if (string.IsNullOrEmpty(tenant.Password))
+        {
+            return value;
+        }
+
+        var basicToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{tenant.Username}:{tenant.Password}"));
+        foreach (var secret in new[] { tenant.Password, basicToken, basicToken.Replace('+', '-').Replace('/', '_') }
+                     .Distinct(StringComparer.Ordinal))
+        {
+            value = value.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
+        }
+
+        return value;
     }
 
     private static string? GetString(JsonElement element, string propertyName) =>
@@ -258,9 +288,11 @@ public sealed class EegFakturaClient(
 
     private sealed record RawDataRequest(
         string EcId,
-        IReadOnlyList<string> Meters,
+        IReadOnlyList<RawDataTarget> Cps,
         long Start,
         long End);
+
+    private sealed record RawDataTarget(string MeteringPoint);
 
     private sealed class RawMeterData
     {

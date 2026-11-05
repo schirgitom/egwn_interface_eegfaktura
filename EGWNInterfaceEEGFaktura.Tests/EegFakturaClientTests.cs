@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Application.Abstractions;
 using EGWNInterfaceEEGFaktura.Application.Services;
@@ -69,10 +70,17 @@ public sealed class EegFakturaClientTests
             Assert.Equal("Basic", request.Headers.Authorization?.Scheme);
             Assert.Equal("YTo-Pw==", request.Headers.Authorization?.Parameter);
             var body = await request.Content!.ReadAsStringAsync(cancellationToken);
-            Assert.Contains("\"ecId\":\"AT00800000000RC101900000000000138\"", body);
-            Assert.Contains("\"meters\":[\"meter-1\"]", body);
-            Assert.Contains("\"start\":1000", body);
-            Assert.Contains("\"end\":2000", body);
+            using var document = JsonDocument.Parse(body);
+            var payload = document.RootElement;
+            Assert.Equal(4, payload.EnumerateObject().Count());
+            Assert.Equal(Tenant.EcId, payload.GetProperty("ecId").GetString());
+            Assert.Equal(1000, payload.GetProperty("start").GetInt64());
+            Assert.Equal(2000, payload.GetProperty("end").GetInt64());
+            var targets = payload.GetProperty("cps").EnumerateArray().ToArray();
+            Assert.Equal(2, targets.Length);
+            Assert.Equal("meter-1", targets[0].GetProperty("meteringPoint").GetString());
+            Assert.Equal("meter-2", targets[1].GetProperty("meteringPoint").GetString());
+            Assert.All(targets, target => Assert.Single(target.EnumerateObject()));
 
             return JsonResponse(
                 """
@@ -90,7 +98,7 @@ public sealed class EegFakturaClientTests
 
         var response = await client.FetchRawReadingsAsync(
             Tenant,
-            ["meter-1"],
+            ["meter-1", "meter-2"],
             1000,
             2000,
             CancellationToken.None);
@@ -219,6 +227,32 @@ public sealed class EegFakturaClientTests
         Assert.Equal(Convert.ToBase64String(Encoding.UTF8.GetBytes("second:different")), headers[1].Authorization);
     }
 
+    [Fact]
+    public async Task FetchRawReadingsAsync_LogsBadRequestWithTenantAndRedactedResponseAtWarningLevel()
+    {
+        var logger = new RecordingLogger(LogLevel.Warning);
+        var handler = new StubHttpMessageHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent("Invalid ecId for >? (YTo-Pw==)")
+            }));
+        var client = CreateClient(handler, logger);
+
+        var exception = await Assert.ThrowsAsync<HttpRequestException>(() =>
+            client.FetchRawReadingsAsync(Tenant, ["meter-1"], 1000, 2000, CancellationToken.None));
+
+        Assert.Equal(HttpStatusCode.BadRequest, exception.StatusCode);
+        Assert.Contains("tenant-1", exception.Message);
+        var message = Assert.Single(logger.Messages);
+        Assert.Contains("tenant tenant-1", message);
+        Assert.Contains("ecId AT00800000000RC101900000000000138", message);
+        Assert.Contains("https://eeg-faktura.at/energystore/query/rawdata", message);
+        Assert.Contains("HTTP 400", message);
+        Assert.Contains("Invalid ecId for [REDACTED] ([REDACTED])", message);
+        Assert.DoesNotContain(">?", message);
+        Assert.DoesNotContain("YTo-Pw==", message);
+    }
+
     private static EegFakturaClient CreateClient(
         HttpMessageHandler handler,
         ILogger<EegFakturaClient>? logger = null)
@@ -245,14 +279,14 @@ public sealed class EegFakturaClientTests
             send(request, cancellationToken);
     }
 
-    private sealed class RecordingLogger : ILogger<EegFakturaClient>
+    private sealed class RecordingLogger(LogLevel enabledLevel = LogLevel.Debug) : ILogger<EegFakturaClient>
     {
         public List<string> Messages { get; } = [];
 
         public IDisposable BeginScope<TState>(TState state) where TState : notnull =>
             NullScope.Instance;
 
-        public bool IsEnabled(LogLevel logLevel) => logLevel == LogLevel.Debug;
+        public bool IsEnabled(LogLevel logLevel) => logLevel == enabledLevel;
 
         public void Log<TState>(
             LogLevel logLevel,

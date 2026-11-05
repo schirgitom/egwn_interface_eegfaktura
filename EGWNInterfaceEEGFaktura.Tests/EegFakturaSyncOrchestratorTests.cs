@@ -2,6 +2,7 @@ using EGWNInterfaceEEGFaktura.Application.Abstractions;
 using EGWNInterfaceEEGFaktura.Application.Options;
 using EGWNInterfaceEEGFaktura.Application.Services;
 using EGWNInterfaceEEGFaktura.Domain;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -22,7 +23,8 @@ public sealed class EegFakturaSyncOrchestratorTests
             }
         };
         var publisher = new FakePublisher();
-        var orchestrator = CreateOrchestrator(client, publisher, now);
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, publisher, now, metrics: metrics);
 
         var result = await orchestrator.SyncAsync(CancellationToken.None);
 
@@ -37,6 +39,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(1.2m, reading.TotalConsumptionValue);
         Assert.Equal(0.9m, reading.GridShareValue);
         Assert.Equal(0.3m, reading.CommunityShareValue);
+        Assert.Equal(("meter-1", "tenant-1", 1, true), Assert.Single(metrics.MeterReadings));
     }
 
     [Fact]
@@ -45,7 +48,8 @@ public sealed class EegFakturaSyncOrchestratorTests
         var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var end = start.AddDays(14);
         var client = new FakeEegFakturaClient([new EegMeterPoint("meter-1", start)]);
-        var orchestrator = CreateOrchestrator(client, new FakePublisher(), end, chunkDays: 7);
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, new FakePublisher(), end, chunkDays: 7, metrics: metrics);
 
         var result = await orchestrator.BackfillAsync(null, end, CancellationToken.None);
 
@@ -55,6 +59,9 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(start.ToUnixTimeMilliseconds(), client.Ranges[0].Start);
         Assert.Equal(start.AddDays(7).ToUnixTimeMilliseconds(), client.Ranges[0].End);
         Assert.Equal(start.AddDays(7).AddMilliseconds(1).ToUnixTimeMilliseconds(), client.Ranges[1].Start);
+        Assert.Equal(2, metrics.BackfillTotal);
+        Assert.Equal((2, 0, 0), metrics.BackfillProgress);
+        Assert.Equal(0, metrics.BackfillReadings);
     }
 
     [Fact]
@@ -163,6 +170,67 @@ public sealed class EegFakturaSyncOrchestratorTests
     }
 
     [Fact]
+    public async Task SyncAsync_LogsTenantWhenSecondTenantFails()
+    {
+        var now = new DateTimeOffset(2026, 11, 4, 9, 0, 0, TimeSpan.Zero);
+        var client = new FakeEegFakturaClient([])
+        {
+            MeterPointsByTenant = new Dictionary<string, IReadOnlyList<EegMeterPoint>>
+            {
+                ["tenant-1"] = [new EegMeterPoint("meter-1", null)],
+                ["tenant-2"] = [new EegMeterPoint("meter-2", null)]
+            },
+            FailRawDataForTenant = "tenant-2"
+        };
+        var logger = new RecordingLogger();
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, new FakePublisher(), now, tenants: TwoTenants(), logger: logger, metrics: metrics);
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => orchestrator.SyncAsync(CancellationToken.None));
+
+        Assert.Contains(logger.Messages, message => message.Contains("Starting EEGFaktura sync for tenant tenant-1"));
+        Assert.Contains(logger.Messages, message => message.Contains("Completed EEGFaktura sync for tenant tenant-1"));
+        Assert.Contains(logger.Messages, message => message.Contains("Starting EEGFaktura sync for tenant tenant-2"));
+        Assert.Contains(logger.Messages, message => message.Contains("failed for tenant tenant-2 (ecId ec-2)"));
+        Assert.Equal(("meter-2", "tenant-2", 0, false), metrics.MeterReadings.Last());
+    }
+
+    [Fact]
+    public async Task SyncAsync_RecordsEmptyReadingsAsSuccess()
+    {
+        var now = new DateTimeOffset(2026, 11, 4, 9, 0, 0, TimeSpan.Zero);
+        var client = new FakeEegFakturaClient([new EegMeterPoint("meter-1", null)]);
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, new FakePublisher(), now, metrics: metrics);
+
+        var result = await orchestrator.SyncAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.ReadingCount);
+        Assert.Equal(("meter-1", "tenant-1", 0, true), Assert.Single(metrics.MeterReadings));
+    }
+
+    [Fact]
+    public async Task SyncAsync_RecordsBatchFailureForEveryRequestedMeter()
+    {
+        var now = new DateTimeOffset(2026, 11, 4, 9, 0, 0, TimeSpan.Zero);
+        var client = new FakeEegFakturaClient([
+            new EegMeterPoint("meter-1", null),
+            new EegMeterPoint("meter-2", null)
+        ])
+        {
+            FailRawDataForTenant = "tenant-1"
+        };
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, new FakePublisher(), now, metrics: metrics);
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => orchestrator.SyncAsync(CancellationToken.None));
+
+        Assert.Equal(
+            [("meter-1", "tenant-1", 0, false), ("meter-2", "tenant-1", 0, false)],
+            metrics.MeterReadings);
+    }
+
+    [Fact]
     public async Task TriggerMeterReadingAsync_TargetsOnlySelectedTenantForSingleMeter()
     {
         var now = new DateTimeOffset(2026, 10, 29, 12, 0, 0, TimeSpan.Zero);
@@ -244,6 +312,30 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(["tenant-1", "tenant-2"], client.FetchedTenants.Select(tenant => tenant.TenantId));
     }
 
+    [Fact]
+    public async Task BackfillAsync_RecordsFailedRequestAndRemainingWork()
+    {
+        var from = new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
+        var client = new FakeEegFakturaClient([])
+        {
+            MeterPointsByTenant = new Dictionary<string, IReadOnlyList<EegMeterPoint>>
+            {
+                ["tenant-1"] = [new EegMeterPoint("meter-1", from)],
+                ["tenant-2"] = [new EegMeterPoint("meter-2", from)]
+            },
+            FailRawDataForTenant = "tenant-2"
+        };
+        var metrics = new FakeMetrics();
+        var orchestrator = CreateOrchestrator(client, new FakePublisher(), from.AddDays(8), tenants: TwoTenants(), metrics: metrics);
+
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            orchestrator.BackfillAsync(from, from.AddDays(8), CancellationToken.None));
+
+        Assert.Equal(4, metrics.BackfillTotal);
+        Assert.Equal((1, 1, 2), metrics.BackfillProgress);
+        Assert.Equal(("meter-2", "tenant-2", 0, false), metrics.MeterReadings.Last());
+    }
+
     private static List<EegFakturaTenantOptions> TwoTenants() =>
     [
         new() { TenantId = "tenant-1", EcId = "ec-1", Username = "username-1", Password = "password-1", CommunityName = "Community 1" },
@@ -255,10 +347,13 @@ public sealed class EegFakturaSyncOrchestratorTests
         FakePublisher publisher,
         DateTimeOffset now,
         int chunkDays = 7,
-        List<EegFakturaTenantOptions>? tenants = null) =>
+        List<EegFakturaTenantOptions>? tenants = null,
+        ILogger<EegFakturaSyncOrchestrator>? logger = null,
+        FakeMetrics? metrics = null) =>
         new(
             client,
             publisher,
+            metrics ?? new FakeMetrics(),
             Options.Create(new EegFakturaOptions
             {
                 TenantId = "tenant-1",
@@ -271,7 +366,39 @@ public sealed class EegFakturaSyncOrchestratorTests
                 BackfillChunkDays = chunkDays
             }),
             new FixedTimeProvider(now),
-            NullLogger<EegFakturaSyncOrchestrator>.Instance);
+            logger ?? NullLogger<EegFakturaSyncOrchestrator>.Instance);
+
+    private sealed class FakeMetrics : IEegFakturaMetrics
+    {
+        public List<(string MeterId, string TenantId, int ReadingCount, bool Success)> MeterReadings { get; } = [];
+
+        public int BackfillTotal { get; private set; }
+
+        public (int Completed, int Failed, int Remaining) BackfillProgress { get; private set; }
+
+        public int BackfillReadings { get; private set; }
+
+        public void RecordMeterReading(string meterId, string tenantId, int readingCount, TimeSpan duration, bool success) =>
+            MeterReadings.Add((meterId, tenantId, readingCount, success));
+
+        public void RecordBackfillStarted(int itemCount)
+        {
+            BackfillTotal = itemCount;
+            BackfillProgress = (0, 0, itemCount);
+        }
+
+        public void UpdateBackfillProgress(int completed, int failed, int remaining) =>
+            BackfillProgress = (completed, failed, remaining);
+
+        public void RecordBackfillCompleted(int itemCount, int completed, int failed, int remaining, int readings, TimeSpan duration)
+        {
+            BackfillTotal = itemCount;
+            BackfillReadings = readings;
+            UpdateBackfillProgress(completed, failed, remaining);
+        }
+
+        public void SetJobSchedule(string jobName, DateTimeOffset? nextFireUtc, DateTimeOffset? previousFireUtc) { }
+    }
 
     private sealed class FakeEegFakturaClient(IReadOnlyList<EegMeterPoint> meterPoints) : IEegFakturaClient
     {
@@ -281,6 +408,8 @@ public sealed class EegFakturaSyncOrchestratorTests
 
         public IReadOnlyDictionary<string, IReadOnlyList<EegRawReading>> Readings { get; init; } =
             new Dictionary<string, IReadOnlyList<EegRawReading>>();
+
+        public string? FailRawDataForTenant { get; init; }
 
         public List<string> DiscoveredTenants { get; } = [];
 
@@ -312,6 +441,11 @@ public sealed class EegFakturaSyncOrchestratorTests
             long endUnixMilliseconds,
             CancellationToken cancellationToken)
         {
+            if (tenant.TenantId == FailRawDataForTenant)
+            {
+                throw new HttpRequestException("EEGFaktura request failed with HTTP 400.");
+            }
+
             Start = startUnixMilliseconds;
             End = endUnixMilliseconds;
             MeterIds = meterIds;
@@ -335,5 +469,30 @@ public sealed class EegFakturaSyncOrchestratorTests
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class RecordingLogger : ILogger<EegFakturaSyncOrchestrator>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull =>
+            NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Messages.Add(formatter(state, exception));
+
+        private sealed class NullScope : IDisposable
+        {
+            public static NullScope Instance { get; } = new();
+
+            public void Dispose() { }
+        }
     }
 }
