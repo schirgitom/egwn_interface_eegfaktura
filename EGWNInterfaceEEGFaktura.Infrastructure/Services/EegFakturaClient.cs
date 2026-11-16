@@ -152,7 +152,8 @@ public sealed class EegFakturaClient(
                 meterReadings.Add(new EegRawReading(
                     DateTimeOffset.FromUnixTimeMilliseconds(reading.Timestamp.Value),
                     total,
-                    communityShare));
+                    communityShare,
+                    meterData.Direction!.ToUpperInvariant()));
             }
 
             readings[meterId] = meterReadings;

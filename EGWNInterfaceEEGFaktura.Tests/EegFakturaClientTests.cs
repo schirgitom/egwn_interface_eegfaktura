@@ -107,6 +107,7 @@ public sealed class EegFakturaClientTests
         Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1000), reading.Timestamp);
         Assert.Equal(1.25m, reading.TotalValue);
         Assert.Equal(0.85m, reading.CommunityShareValue);
+        Assert.Equal("GENERATION", reading.Direction);
         Assert.Equal(0.4m, EegReadingMapper.Map(reading).GridShareValue);
     }
 
@@ -137,6 +138,7 @@ public sealed class EegFakturaClientTests
         Assert.InRange(mapped.GridShareValue!.Value / mapped.TotalConsumptionValue!.Value, 0m, 1m);
         Assert.InRange(mapped.CommunityShareValue!.Value / mapped.TotalConsumptionValue.Value, 0m, 1m);
         Assert.Equal(0.000142m, readings[1].CommunityShareValue);
+        Assert.All(readings, reading => Assert.Equal("CONSUMPTION", reading.Direction));
     }
 
     [Theory]

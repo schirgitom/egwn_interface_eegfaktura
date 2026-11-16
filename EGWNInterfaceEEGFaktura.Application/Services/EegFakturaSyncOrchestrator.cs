@@ -243,12 +243,21 @@ public sealed class EegFakturaSyncOrchestrator(
                     continue;
                 }
 
+                var direction = meterReadings[0].Direction;
+                if (direction is not ("GENERATION" or "CONSUMPTION")
+                    || meterReadings.Any(reading => reading.Direction != direction))
+                {
+                    throw new InvalidDataException(
+                        $"EEGFaktura returned inconsistent energy directions for meter '{meterPoint.MeterPointNumber}'.");
+                }
+
                 var publication = new EegMeterReadingsPublication(
                     meterPoint.MeterPointNumber,
                     tenant.TenantId,
                     string.IsNullOrWhiteSpace(tenant.CommunityName) ? tenant.TenantId : tenant.CommunityName,
                     meterReadings.Select(EegReadingMapper.Map).ToArray(),
-                    timeProvider.GetUtcNow());
+                    timeProvider.GetUtcNow(),
+                    direction);
 
                 await resultPublisher.PublishAsync(publication, cancellationToken);
                 readingCount += publication.Readings.Count;

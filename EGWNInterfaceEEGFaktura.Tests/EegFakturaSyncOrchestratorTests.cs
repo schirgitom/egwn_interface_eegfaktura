@@ -19,7 +19,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         {
             Readings = new Dictionary<string, IReadOnlyList<EegRawReading>>
             {
-                ["meter-1"] = [new EegRawReading(now.AddMinutes(-15), 1.2m, 0.3m)]
+                ["meter-1"] = [new EegRawReading(now.AddMinutes(-15), 1.2m, 0.3m, "CONSUMPTION")]
             }
         };
         var publisher = new FakePublisher();
@@ -35,6 +35,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         var publication = Assert.Single(publisher.Publications);
         Assert.Equal("meter-1", publication.MeterPointNumber);
         Assert.Equal("tenant-1", publication.CommunityId);
+        Assert.Equal("CONSUMPTION", publication.EnergyDirection);
         var reading = Assert.Single(publication.Readings);
         Assert.Equal(1.2m, reading.TotalConsumptionValue);
         Assert.Equal(0.9m, reading.GridShareValue);
@@ -72,8 +73,8 @@ public sealed class EegFakturaSyncOrchestratorTests
         {
             Readings = new Dictionary<string, IReadOnlyList<EegRawReading>>
             {
-                ["meter-1"] = [new EegRawReading(now, 1.2m, 0.3m)],
-                ["meter-2"] = [new EegRawReading(now, 2.2m, 0.4m)]
+                ["meter-1"] = [new EegRawReading(now, 1.2m, 0.3m, "CONSUMPTION")],
+                ["meter-2"] = [new EegRawReading(now, 2.2m, 0.4m, "GENERATION")]
             }
         };
         var publisher = new FakePublisher();
@@ -88,6 +89,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(1, client.MeterDiscoveryCalls);
         Assert.Equal(["meter-1", "meter-2"], client.MeterIds);
         Assert.Equal(["meter-1", "meter-2"], publisher.Publications.Select(publication => publication.MeterPointNumber));
+        Assert.Equal(["CONSUMPTION", "GENERATION"], publisher.Publications.Select(publication => publication.EnergyDirection));
     }
 
     [Fact]
@@ -99,7 +101,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         {
             Readings = new Dictionary<string, IReadOnlyList<EegRawReading>>
             {
-                ["meter-1"] = [new EegRawReading(now, 1.2m, 0.3m)]
+                ["meter-1"] = [new EegRawReading(now, 1.2m, 0.3m, "CONSUMPTION")]
             }
         };
         var publisher = new FakePublisher();
@@ -117,6 +119,29 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(from.ToUnixTimeMilliseconds(), client.Start);
         Assert.Equal(now.ToUnixTimeMilliseconds(), client.End);
         Assert.Equal("tenant-1", Assert.Single(publisher.Publications).CommunityId);
+    }
+
+    [Fact]
+    public async Task SyncAsync_RejectsMixedDirectionsWithinOneMeter()
+    {
+        var now = new DateTimeOffset(2026, 10, 29, 12, 0, 0, TimeSpan.Zero);
+        var client = new FakeEegFakturaClient([new EegMeterPoint("meter-1", null)])
+        {
+            Readings = new Dictionary<string, IReadOnlyList<EegRawReading>>
+            {
+                ["meter-1"] =
+                [
+                    new EegRawReading(now, 1m, 0.2m, "CONSUMPTION"),
+                    new EegRawReading(now.AddMinutes(15), 1m, 0.2m, "GENERATION")
+                ]
+            }
+        };
+        var publisher = new FakePublisher();
+        var orchestrator = CreateOrchestrator(client, publisher, now);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => orchestrator.SyncAsync(CancellationToken.None));
+
+        Assert.Empty(publisher.Publications);
     }
 
     [Fact]
@@ -147,11 +172,11 @@ public sealed class EegFakturaSyncOrchestratorTests
             {
                 ["tenant-1"] = new Dictionary<string, IReadOnlyList<EegRawReading>>
                 {
-                    ["meter-1"] = [new EegRawReading(now, 1m, 0.2m)]
+                    ["meter-1"] = [new EegRawReading(now, 1m, 0.2m, "CONSUMPTION")]
                 },
                 ["tenant-2"] = new Dictionary<string, IReadOnlyList<EegRawReading>>
                 {
-                    ["meter-2"] = [new EegRawReading(now, 2m, 0.5m)]
+                    ["meter-2"] = [new EegRawReading(now, 2m, 0.5m, "GENERATION")]
                 }
             }
         };
@@ -167,6 +192,7 @@ public sealed class EegFakturaSyncOrchestratorTests
         Assert.Equal(["username-1", "username-2"], client.FetchedTenants.Select(tenant => tenant.Username));
         Assert.Equal(["tenant-1", "tenant-2"], publisher.Publications.Select(publication => publication.CommunityId));
         Assert.Equal(["Community 1", "Community 2"], publisher.Publications.Select(publication => publication.CommunityName));
+        Assert.Equal(["CONSUMPTION", "GENERATION"], publisher.Publications.Select(publication => publication.EnergyDirection));
     }
 
     [Fact]
@@ -240,7 +266,7 @@ public sealed class EegFakturaSyncOrchestratorTests
             {
                 ["tenant-2"] = new Dictionary<string, IReadOnlyList<EegRawReading>>
                 {
-                    ["meter-1"] = [new EegRawReading(now, 2m, 0.5m)]
+                    ["meter-1"] = [new EegRawReading(now, 2m, 0.5m, "GENERATION")]
                 }
             }
         };

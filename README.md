@@ -19,7 +19,7 @@ The response values map to the EDA-compatible publication fields according to th
 
 Missing or inconsistent energy values are rejected instead of publishing readings with negative shares.
 
-The RabbitMQ JSON envelope and field names match the EDA meter publication. `direction` and `qov` are not added to the message, so the existing Persister schema remains unchanged. RabbitMQ publishes to the `eda.sync` topic exchange with routing key `eda.sync.result`.
+The RabbitMQ JSON envelope retains the EDA meter publication fields and adds a top-level `energyDirection` (`CONSUMPTION` or `GENERATION`) for each meter. The existing reading fields remain unchanged; `qov` is not included. RabbitMQ publishes to the `eda.sync` topic exchange with routing key `eda.sync.result`. Consumers of the EDA publication should allow the additional `energyDirection` field.
 
 ## Configuration and secrets
 

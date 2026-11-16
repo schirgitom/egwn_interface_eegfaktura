@@ -5,4 +5,5 @@ public sealed record EegMeterReadingsPublication(
     string CommunityId,
     string CommunityName,
     IReadOnlyList<EegMeterReading> Readings,
-    DateTimeOffset CreatedAtUtc);
+    DateTimeOffset CreatedAtUtc,
+    string EnergyDirection);

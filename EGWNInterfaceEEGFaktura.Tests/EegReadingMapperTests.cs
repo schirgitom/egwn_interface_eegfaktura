@@ -12,21 +12,26 @@ public sealed class EegReadingMapperTests
         var reading = new EegRawReading(
             DateTimeOffset.Parse("2026-10-27T09:00:00Z"),
             1.25m,
-            0.4m);
+            0.4m,
+            "CONSUMPTION");
 
         var publication = new EegMeterReadingsPublication(
             "meter-1",
             "tenant-1",
             "community",
             [EegReadingMapper.Map(reading)],
-            DateTimeOffset.Parse("2026-10-29T12:00:00Z"));
+            DateTimeOffset.Parse("2026-10-29T12:00:00Z"),
+            reading.Direction);
 
         var json = JsonSerializer.Serialize(publication, new JsonSerializerOptions(JsonSerializerDefaults.Web));
 
         Assert.Contains("\"totalConsumptionValue\":1.25", json);
         Assert.Contains("\"gridShareValue\":0.85", json);
         Assert.Contains("\"communityShareValue\":0.4", json);
-        Assert.DoesNotContain("\"direction\"", json);
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal("CONSUMPTION", document.RootElement.GetProperty("energyDirection").GetString());
+        Assert.False(document.RootElement.TryGetProperty("direction", out _));
+        Assert.False(document.RootElement.GetProperty("readings")[0].TryGetProperty("energyDirection", out _));
         Assert.DoesNotContain("\"qov\"", json);
     }
 
@@ -36,7 +41,8 @@ public sealed class EegReadingMapperTests
         var reading = new EegRawReading(
             DateTimeOffset.Parse("2026-10-27T09:00:00Z"),
             1.25m,
-            null);
+            null,
+            "CONSUMPTION");
 
         var mapped = EegReadingMapper.Map(reading);
 
@@ -51,7 +57,8 @@ public sealed class EegReadingMapperTests
         var reading = new EegRawReading(
             DateTimeOffset.Parse("2026-10-27T09:00:00Z"),
             0.007m,
-            0.007m);
+            0.007m,
+            "CONSUMPTION");
 
         var mapped = EegReadingMapper.Map(reading);
 
